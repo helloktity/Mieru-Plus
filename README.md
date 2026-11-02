@@ -19,46 +19,92 @@ mieru 一键安装脚本，自动搭建 TCP 和 UDP 账号，生成官方配置�
 ## 一键脚本
 
 ```bash
-wget -O mieru-plus.sh https://raw.githubusercontent.com/Alvin9999-newpac/Mieru-Plus/main/mieru-plus.sh && chmod +x mieru-plus.sh && bash mieru-plus.sh
+wget -O mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-Plus/main/mieru-plus.sh && chmod +x mieru-plus.sh && bash mieru-plus.sh
 ```
 
 或
 
 ```bash
-curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/Alvin9999-newpac/Mieru-Plus/main/mieru-plus.sh && chmod +x mieru-plus.sh && bash mieru-plus.sh
+curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-Plus/main/mieru-plus.sh && chmod +x mieru-plus.sh && bash mieru-plus.sh
 ```
+
+> 只需执行一次。脚本会自动把自身注册为 `mieru` 命令，以后在任意目录输入 `mieru` 即可打开管理面板，无需重复下载。
+
+---
+
+## v2.0.0 更新日志
+
+- **运行即进菜单**：自动识别 `mita` 是否已安装，已安装时直接进入管理面板，不再每次执行都重装
+- **注册 `mieru` 快捷命令**：首次以 root 运行后，自动复制自身到 `/usr/local/bin/mieru`
+- **新增子命令**：`install / status / config / start / stop / restart / upgrade / regen / bbr / logs / export / backup / uninstall / link`
+- **升级保留账号**：`mieru upgrade` 只更新 mita 程序，端口与凭据不变
+- **重新生成账号**：一键随机更换端口 / 用户名 / 密码
+- **配置导出与备份恢复**：客户端配置导出到 `/root/mieru-clients`，配置备份到 `/root/mieru-backup`
+- **防火墙增强**：新增 firewalld 支持（原版仅 ufw / iptables）
+- **稳定性修复**：移除 `set -e`，避免管道 SIGPIPE 导致脚本中途退出；下载增加重试；dpkg 失败自动补依赖
 
 ---
 
 ## 菜单说明
 
 ```
- ================================================
-   Mieru 管理脚本
-   https://github.com/Alvin9999-newpac/Mieru-Plus
- ================================================
+ ==================================================
+   Mieru 管理面板 v2.0.0
+   https://github.com/helloktity/Mieru-Plus
+ ==================================================
  BBR 加速：  已启用
  服务状态：  运行中
  当前版本：  v3.28.0
- ------------------------------------------------
- 1. 安装 / 重装
- 2. 查看节点 & 配置
- 3. 重启服务
- 4. 一键开启 BBR
- 5. 查看实时日志
- 6. 卸载
- 0. 退出
- ================================================
+ 开机自启：  已开启
+ --------------------------------------------------
+ 1.  查看节点信息 / 客户端配置
+ 2.  启动服务
+ 3.  停止服务
+ 4.  重启服务
+ 5.  设置开机自启
+ 6.  升级到最新版本（保留账号）
+ 7.  重新生成账号（换端口 / 换密码）
+ 8.  一键开启 BBR
+ 9.  查看日志
+ 10. 导出配置到文件
+ 11. 备份 / 恢复配置
+ 12. 重装 Mieru
+ 13. 卸载
+ 0.  退出
+ ==================================================
 ```
 
 | 选项 | 说明 |
 |------|------|
-| 1 | 自动下载最新版 mita，生成两个账号（TCP + UDP），写入配置并启动服务 |
-| 2 | 查看当前节点信息、客户端 JSON 配置、Clash Meta 配置片段 |
-| 3 | 重启 mita 服务 |
-| 4 | 一键开启 BBR 网络加速（需内核 4.9+） |
-| 5 | 实时查看 mita 运行日志（Ctrl+C 退出） |
-| 6 | 卸载 mita 及所有配置文件 |
+| 1 | 查看当前节点信息、客户端 JSON 配置、Clash Meta 配置片段、mierus:// 导入链接 |
+| 2 | 启动 mita 服务 |
+| 3 | 停止 mita 服务 |
+| 4 | 重启 mita 服务 |
+| 5 | 设置 / 确认 systemd 开机自启 |
+| 6 | 升级 mita 到最新版本，账号与端口保留 |
+| 7 | 随机重新生成端口、用户名、密码（旧配置立即失效，需重新导入客户端） |
+| 8 | 一键开启 BBR 网络加速（需内核 4.9+） |
+| 9 | 查看最近 200 行日志，或实时跟随（Ctrl+C 退出） |
+| 10 | 导出客户端 JSON 与 Clash 配置文件到 `/root/mieru-clients` |
+| 11 | 备份 `/etc/mita` 到 `/root/mieru-backup`，或从备份恢复 |
+| 12 | 重装 Mieru（重置账号与端口） |
+| 13 | 卸载 mita 及所有配置文件 |
+
+### 子命令（非交互）
+
+```bash
+mieru status        # 查看版本 / 状态 / BBR / 自启
+mieru config        # 输出节点信息与客户端配置
+mieru upgrade       # 升级 mita（保留账号）
+mieru regen         # 重新生成账号与端口
+mieru start|stop|restart
+mieru logs          # 最近 200 行日志
+mieru export        # 导出配置文件到 /root/mieru-clients
+mieru backup        # 备份配置到 /root/mieru-backup
+mieru bbr           # 开启 BBR
+mieru install --custom   # 安装并手动指定端口 / 账号
+mieru uninstall     # 卸载
+```
 
 ---
 
