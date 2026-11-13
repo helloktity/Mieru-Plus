@@ -11,12 +11,13 @@
 #   4. 支持子命令，方便脚本化/非交互调用
 #   5. 新增：启动/停止/状态/升级/重生成账号/备份恢复/firewalld 放行
 #  6. v2.1.0 新增：内置订阅服务，输出订阅链接（兼容 Sub-Store remote 源）
+#  7. v2.2.0 新增：装完默认自带公网 HTTPS 订阅（自动配 nginx 443 + 现有证书）
 #     —— 原有功能全部保留，订阅为纯增量特性
 # ============================================================
 
 set -uo pipefail
 
-SCRIPT_VERSION="v2.1.0"
+SCRIPT_VERSION="v2.2.0"
 MIERU_REPO="enfein/mieru"
 UPSTREAM_REPO="Alvin9999-newpac/Mieru-Plus"
 
@@ -400,6 +401,8 @@ do_install() {
 
   # v2.1.0 新增：安装完同时启用订阅服务（失败不影响 Mieru 本体）
   sub_enable || true
+  # v2.2.0：顺手把公网 HTTPS 订阅也配好（有 nginx + 证书才生效，失败只提示）
+  sub_nginx_apply >/dev/null 2>&1 || warn "公网 HTTPS 订阅未自动配置，可稍后执行：mieru sub nginx"
 
   _show_config
   pause
@@ -510,6 +513,10 @@ EOF
     echo "   ${SUB_L}/sub?target=clash          (Sub-Store 订阅源 / Clash 片段)"
     echo "   ${SUB_L}/sub?target=clash-full     (完整 Clash 配置)"
     echo "   ${SUB_L}/sub?target=base64         (通用 base64 订阅)"
+    local PUB_L
+    if PUB_L=$(sub_public_url); then
+      echo "   公网 HTTPS：${PUB_L}/sub?target=clash"
+    fi
     echo "   更多格式 / 公网链接 / 自检：mieru sub"
   fi
   echo -e "\n${BOLD}${GREEN} ==============================${PLAIN}\n"
@@ -819,7 +826,7 @@ do_uninstall() {
   pause
 }
 
-# ──────────── 订阅服务（v2.1.0 纯增量新增） ────────────
+# ──────────── 订阅服务（v2.1.0 纯增量新增，v2.2.0 加公网 HTTPS） ────────────
 # 目标：让本脚本自己输出一个订阅 URL，Sub-Store 可以像 3x-ui 那样用
 #       source=remote 订阅它，而不必由同步脚本写死 local content。
 #   * 每次请求实时读取 /etc/mita/.credentials，执行 regen 后立刻生效
@@ -1243,62 +1250,123 @@ sub_status() {
 
 sub_check() {
   [[ -f "$SUB_CONF" ]] || { err "订阅服务尚未启用，执行：mieru sub on"; return 1; }
-  local base code
-  base="http://127.0.0.1:$(sub_get SUB_PORT)/$(sub_get SUB_TOKEN)"
-  echo -n "健康检查 : "; curl -fsS --max-time 5 "${base}/health" 2>/dev/null || echo "失败"
-  echo -n "Clash 订阅 : "
-  code=$(curl -sS -o /tmp/mieru-sub-check.yaml -w '%{http_code}' --max-time 5 "${base}/sub?target=clash" 2>/dev/null)
-  echo "HTTP ${code} / $(grep -c '^- name:' /tmp/mieru-sub-check.yaml 2>/dev/null || echo 0) 个节点"
-  echo -n "完整配置 : "
-  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 "${base}/sub?target=clash-full" 2>/dev/null
-  echo -n "base64   : "
-  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 "${base}/sub?target=base64" 2>/dev/null
-  echo -n "无 token : "
-  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 "http://127.0.0.1:$(sub_get SUB_PORT)/sub" 2>/dev/null
-  rm -f /tmp/mieru-sub-check.yaml
-  echo -e "${CYAN}订阅内容预览：${PLAIN}"
+  systemctl is-active --quiet "$SUB_UNIT_NAME" 2>/dev/null || {
+    err "服务没在运行，先执行：mieru sub on"
+    return 1
+  }
+  local token base url code count failed=0 tmp
+  token=$(sub_get SUB_TOKEN)
+  base="http://127.0.0.1:$(sub_get SUB_PORT)/${token}"
+  tmp=$(mktemp)
+
+  echo
+  echo -e "${BOLD}${CYAN} 自检：$(sub_get SUB_BIND):$(sub_get SUB_PORT)${PLAIN}"
+  for target in clash clash-full base64 uri json; do
+    url="${base}/sub?target=${target}"
+    code=$(curl -s -o "$tmp" -w '%{http_code}' --max-time 10 "$url" 2>/dev/null)
+    case "$target" in
+      clash|clash-full) count=$(awk '/^proxies:/{f=1;next} /^[a-zA-Z-]+:/{f=0} f&&/^- name:/{c++} END{print c+0}' "$tmp" 2>/dev/null) ;;
+      *)                count="" ;;
+    esac
+    if [[ "$code" == "200" ]]; then
+      if [[ -n "$count" ]]; then
+        echo -e "  ${GREEN}[OK]${PLAIN}   ${target}   HTTP ${code}   ${count} 个节点"
+      else
+        echo -e "  ${GREEN}[OK]${PLAIN}   ${target}   HTTP ${code}"
+      fi
+    else
+      echo -e "  ${RED}[FAIL]${PLAIN} ${target}   HTTP ${code}"
+      failed=1
+    fi
+  done
+  rm -f "$tmp"
+
+  local health
+  health=$(curl -s --max-time 5 "${base}/health" 2>/dev/null)
+  if [[ "$health" == "ok" ]]; then
+    echo -e "  ${GREEN}[OK]${PLAIN}   health    HTTP 200"
+  else
+    echo -e "  ${RED}[FAIL]${PLAIN} health    ${health:-无响应}"
+    failed=1
+  fi
+
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$(sub_get SUB_PORT)/sub" 2>/dev/null)
+  if [[ "$code" == "404" ]]; then
+    echo -e "  ${GREEN}[OK]${PLAIN}   无 token  正确返回 404"
+  else
+    echo -e "  ${YELLOW}[!!]${PLAIN} 无 token  返回 ${code}（预期 404）"
+  fi
+
+  echo -e "\n${CYAN} 内容预览（密码已脱敏）：${PLAIN}"
   curl -fsS --max-time 5 "${base}/sub?target=clash" 2>/dev/null | sed 's/password: .*/password: ***/'
+  return $failed
 }
 
 sub_links() {
   [[ -f "$SUB_CONF" ]] || { warn "订阅服务尚未启用，执行：mieru sub on"; return 1; }
-  local token port bind server base
+  local token port bind server base host label pub
   token=$(sub_get SUB_TOKEN)
   port=$(sub_get SUB_PORT)
   bind=$(sub_get SUB_BIND)
   server=$(sub_get SUB_SERVER)
-  base="http://127.0.0.1:${port}/${token}"
-  echo
-  echo -e "${BOLD}${CYAN} ========== 订阅链接（v2.1.0） ==========${PLAIN}"
-  echo " 服务状态 : $(systemctl is-active "$SUB_UNIT_NAME" 2>/dev/null || echo 未启动)"
-  echo " 监听     : ${bind}:${port}    节点地址: ${server}"
-  echo
-  echo -e " ${BOLD}[Sub-Store · remote 源]${PLAIN}  ← 同机推荐，直接填到订阅 URL"
-  echo "   ${base}/sub?target=clash"
-  echo
-  echo "   Clash 片段  : ${base}/sub?target=clash"
-  echo "   完整 Clash  : ${base}/sub?target=clash-full"
-  echo "   通用 base64 : ${base}/sub?target=base64"
-  echo "   URI 明文    : ${base}/sub?target=uri"
-  echo "   JSON        : ${base}/sub?target=json"
-  echo "   健康检查    : ${base}/health"
-  if [[ "$bind" == "127.0.0.1" ]]; then
-    echo
-    warn "当前仅监听 127.0.0.1：以上链接只能本机访问（同机 Sub-Store 足够）"
-    echo "   公网访问：mieru sub public  /  mieru sub nginx（借用现有 nginx 走 HTTPS）"
-  else
-    echo
-    echo -e " ${BOLD}[公网]${PLAIN} 把链接里的 127.0.0.1 换成 ${server} 即可"
+
+  # 与 snell 一致：切到公网监听后，链接自动换成公网地址
+  host="127.0.0.1"
+  label="本机 · Sub-Store 同机"
+  if [[ "$bind" != "127.0.0.1" ]]; then
+    host=$(sub_get SUB_DOMAIN)
+    [[ -n "$host" ]] || host="$server"
+    [[ -n "$host" ]] || host="127.0.0.1"
+    label="公网 · 明文 HTTP"
   fi
-  echo " 管理：mieru sub / mieru sub check / mieru sub store / mieru sub nginx"
-  echo -e "${BOLD}${CYAN} ========================================${PLAIN}"
-  return 0
+  base="http://${host}:${port}/${token}"
+  pub=$(sub_public_url 2>/dev/null) || pub=""
+
+  echo
+  echo -e "${BOLD}${CYAN} ========== 订阅链接 ==========${PLAIN}"
+  echo " 服务状态 : $(systemctl is-active "$SUB_UNIT_NAME" 2>/dev/null || echo 未启动)   监听 : ${bind}:${port}   节点地址 : ${server}"
+
+  if [[ -n "$pub" ]]; then
+    echo
+    echo -e " ${BOLD}[公网 HTTPS]${PLAIN}  外部客户端 / 其它机器上的 Sub-Store"
+    echo "   ${pub}/sub?target=clash"
+    echo "   ${pub}/sub?target=clash-full      (完整 Clash 配置)"
+    echo "   ${pub}/sub?target=base64          (通用 base64)"
+    echo "   ${pub}/sub?target=surge           (Surge)"
+    echo "   ${pub}/health                     (存活探测)"
+  fi
+
+  echo
+  echo -e " ${BOLD}[${label}]${PLAIN}"
+  echo "   ${base}/sub?target=clash"
+  echo "   ${base}/sub?target=clash-full      (完整 Clash 配置)"
+  echo "   ${base}/sub?target=base64          (通用 base64)"
+  echo "   ${base}/sub?target=uri             (明文 URI)"
+  echo "   ${base}/sub?target=json            (JSON)"
+  echo "   ${base}/health                     (存活探测)"
+
+  echo
+  if [[ "$bind" == "127.0.0.1" ]]; then
+    if [[ -n "$pub" ]]; then
+      info "本机监听 + nginx 反代：外部请用上面的 https 链接"
+    else
+      warn "仅监听 127.0.0.1，外部不可访问"
+      echo "   切公网：mieru sub public      走 HTTPS：mieru sub nginx"
+    fi
+  fi
+  echo -e " ${YELLOW}链接等同凭据，别公开贴；泄露后 mieru sub token 重置${PLAIN}"
+  echo -e "${BOLD}${CYAN} ================================${PLAIN}"
 }
 
 sub_store_hint() {
   [[ -f "$SUB_CONF" ]] || { err "订阅服务尚未启用，执行：mieru sub on"; return 1; }
-  local base
-  base="http://127.0.0.1:$(sub_get SUB_PORT)/$(sub_get SUB_TOKEN)"
+  local base host
+  host="127.0.0.1"
+  if [[ "$(sub_get SUB_BIND)" != "127.0.0.1" ]]; then
+    host=$(sub_get SUB_DOMAIN); [[ -n "$host" ]] || host=$(sub_get SUB_SERVER)
+    [[ -n "$host" ]] || host="127.0.0.1"
+  fi
+  base="http://${host}:$(sub_get SUB_PORT)/$(sub_get SUB_TOKEN)"
   echo
   echo -e "${BOLD}${CYAN} Sub-Store 订阅源配置（source = remote）${PLAIN}"
   echo " 在 Sub-Store 中新建「订阅」，类型选远程 / remote，URL 填："
@@ -1321,6 +1389,168 @@ EOF
   echo "  * 执行 mieru regen 换端口/密码后，本 URL 内容立即更新，无需改 Sub-Store"
   echo "  * URL 带 40 位随机 token，请勿公开分享；mieru sub token 可重新生成"
   echo
+}
+
+# ──────────── 公网 HTTPS 订阅（v2.2.0 新增：装完即给外部链接） ────────────
+# 思路：订阅服务仍只监听 127.0.0.1，由本机 nginx 在 443 上反代出去。
+# 域名默认 <IP 的横线形式>.sslip.io（解析到该 IP，无需买域名、无需 DNS 配置）；
+# 证书直接复用机器上现有的，不新申请 —— 域名证书匹配就用域名，只有 IP 证书就用 IP。
+
+# 端口空闲、或只被 nginx 占着 -> 可复用
+sub_port_is_nginx() {
+  local pids p
+  pids=$(ss -lntpH "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  [[ -z "$pids" ]] && return 0
+  for p in $pids; do
+    [[ "$(ps -o comm= -p "$p" 2>/dev/null | tr -d ' ')" == "nginx" ]] || return 1
+  done
+  return 0
+}
+
+sub_cert_match() {   # <cert> <host>
+  [[ -s "$1" ]] || return 1
+  command -v openssl >/dev/null 2>&1 || return 0
+  openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null | grep -q 'does match'
+}
+
+# 选出可用证书，输出 "host|cert|key"；失败返回 1
+sub_detect_tls() {
+  local ip domain d cert key
+  ip=$(sub_get SUB_SERVER)
+  [[ -n "$ip" ]] || ip=$(get_ip)
+  [[ -n "$ip" && "$ip" != "未知" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+  domain=$(sub_get SUB_DOMAIN)
+  [[ -n "$domain" ]] || domain="${ip//./-}.sslip.io"
+
+  local -a dirs=()
+  # nginx 正在用的证书目录最可信（说明续期也由它管）
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && dirs+=("$(dirname "$d")")
+  done < <(nginx -T 2>/dev/null | awk '/ssl_certificate /{print $2}' | tr -d ';' | sort -u)
+  dirs+=(/root/cert/domain /root/cert/ip /etc/nginx/certs /etc/ssl/mieru /etc/pki/tls/mieru)
+
+  # 1) 优先域名证书；2) 退而求其次 IP 证书（https://<IP>/ 一样能用）
+  for d in "${dirs[@]}"; do
+    cert="$d/fullchain.pem"; key="$d/privkey.pem"
+    [[ -f "$cert" && -f "$key" ]] || continue
+    if sub_cert_match "$cert" "$domain"; then echo "${domain}|${cert}|${key}"; return 0; fi
+    if sub_cert_match "$cert" "$ip"; then echo "${ip}|${cert}|${key}"; return 0; fi
+  done
+  # 3) 兜底：有证书就用（自签会告警，但 curl / Sub-Store 仍可拉取）
+  for d in "${dirs[@]}"; do
+    cert="$d/fullchain.pem"; key="$d/privkey.pem"
+    [[ -f "$cert" && -f "$key" ]] && { echo "${domain}|${cert}|${key}"; return 0; }
+  done
+  return 1
+}
+
+sub_nginx_conf_path() { echo "/etc/nginx/conf.d/50-mieru-sub.conf"; }
+
+sub_nginx_apply() {   # [port]
+  [[ -f "$SUB_CONF" ]] || sub_ensure_conf || return 1
+  command -v nginx >/dev/null 2>&1 || {
+    warn "未安装 nginx，跳过自动公网 HTTPS（可执行 mieru sub nginx-hint 手工配置到自己的网站）"
+    return 1
+  }
+  [[ -d /etc/nginx/conf.d ]] || { warn "没有 /etc/nginx/conf.d，跳过自动公网 HTTPS"; return 1; }
+
+  local token port https_port picked host cert key suffix conf alt
+  token=$(sub_get SUB_TOKEN)
+  port=$(sub_get SUB_PORT)
+  https_port=${1:-$(sub_get SUB_HTTPS_PORT)}
+  [[ -n "$https_port" ]] || https_port=443
+
+  if ! sub_port_is_nginx "$https_port"; then
+    alt=$(nginx -T 2>/dev/null | grep -oE 'listen[[:space:]]+[0-9]+[[:space:]]+ssl' | grep -oE '[0-9]+' | head -1)
+    if [[ -n "$alt" ]]; then
+      warn "端口 ${https_port} 被其他程序占用，改挂到 nginx 现有 HTTPS 端口 ${alt}"
+      https_port=$alt
+    else
+      err "端口 ${https_port} 被占用，且找不到可复用的 nginx HTTPS 端口"
+      return 1
+    fi
+  fi
+
+  picked=$(sub_detect_tls) || {
+    err "没找到可用证书（fullchain.pem / privkey.pem），无法启用 HTTPS"
+    info "用 acme.sh 或 certbot 申请后重试：mieru sub nginx"
+    return 1
+  }
+  host=${picked%%|*}; picked=${picked#*|}
+  cert=${picked%%|*}; key=${picked#*|}
+
+  conf=$(sub_nginx_conf_path)
+  cat > "$conf" <<NGINXEOF
+# 由 Mieru-Plus 生成（mieru sub nginx）—— 重新生成会覆盖本文件
+# 订阅服务监听 127.0.0.1:${port}，这里只做 HTTPS 反代；证书：${cert}
+server {
+    listen ${https_port} ssl;
+    server_name ${host};
+
+    ssl_certificate     ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:MieruSub:1m;
+    ssl_session_timeout 10m;
+
+    access_log /var/log/nginx/mieru-sub.log;
+    server_tokens off;
+
+    # 订阅本体（路径里的 token 就是鉴权，转发时保留）
+    location /mieru/${token}/ {
+        proxy_pass http://127.0.0.1:${port}/${token}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 30s;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location / { return 404; }
+}
+NGINXEOF
+
+  if ! nginx -t >/tmp/mieru-sub-nginx.log 2>&1; then
+    err "nginx 配置校验失败，已回滚本次片段"
+    tail -5 /tmp/mieru-sub-nginx.log | sed 's/^/     /'
+    rm -f "$conf"; rm -f /tmp/mieru-sub-nginx.log
+    return 1
+  fi
+  rm -f /tmp/mieru-sub-nginx.log
+
+  systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || {
+    err "nginx 重载失败"; return 1
+  }
+
+  suffix=""
+  [[ "$https_port" != "443" ]] && suffix=":${https_port}"
+  sub_set SUB_HTTPS_PORT "$https_port"
+  sub_set SUB_PUBLIC "https://${host}${suffix}/mieru/${token}"
+  ok "公网订阅已就绪：https://${host}${suffix}/mieru/<token>/sub?target=clash"
+  info "片段：${conf}（证书 ${cert}，端口 ${https_port}）"
+  return 0
+}
+
+sub_nginx_off() {
+  local conf
+  conf=$(sub_nginx_conf_path)
+  [[ -f "$conf" ]] || { info "没有自动配置的公网片段"; return 0; }
+  rm -f "$conf"
+  nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; }
+  sub_set SUB_PUBLIC ""
+  ok "已移除公网 HTTPS 片段（订阅服务本身不变）"
+}
+
+# 公网链接（有则打印，无则返回 1）
+sub_public_url() {
+  local pub
+  pub=$(sub_get SUB_PUBLIC)
+  [[ -n "$pub" ]] || return 1
+  [[ -f "$(sub_nginx_conf_path)" ]] || return 1
+  echo "$pub"
 }
 
 sub_nginx_hint() {
@@ -1348,91 +1578,190 @@ EOF
 }
 
 sub_cleanup() {
+  local nconf; nconf=$(sub_nginx_conf_path)
+  if [[ -f "$nconf" ]]; then
+    rm -f "$nconf"
+    nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; }
+  fi
   systemctl disable --now "$SUB_UNIT_NAME" >/dev/null 2>&1 || true
   rm -f "$SUB_SVC" "$SUB_UNIT" "$SUB_CONF" 2>/dev/null || true
   rm -rf /var/www/mieru-sub 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+# ── 订阅动作：菜单与 CLI 共用（与 snell 脚本同一套结构） ──
+sub_reset_token() {
+  sub_ensure_conf || return 1
+  sub_set SUB_TOKEN "$(rand_str 40)"
+  ok "已重置 token（服务实时读取，无需重启）"
+  info "旧链接立即失效；Sub-Store 若由同步脚本维护，下个周期会自动更新 URL"
+  sub_links
+}
+
+sub_change_port() {
+  sub_ensure_conf || return 1
+  local new_port
+  read -rp " 新的订阅端口（当前 $(sub_get SUB_PORT)）: " new_port || return 1
+  [[ "$new_port" =~ ^[0-9]+$ ]] || { err "端口必须是数字"; return 1; }
+  (( new_port >= 1 && new_port <= 65535 )) || { err "端口范围是 1-65535"; return 1; }
+  sub_set SUB_PORT "$new_port"
+  sub_restart || return 1
+  [[ "$(sub_get SUB_BIND)" != "127.0.0.1" ]] && open_port "$new_port" TCP
+  if [[ -f "$(sub_nginx_conf_path)" ]]; then
+    sub_nginx_apply >/dev/null 2>&1 && ok "公网反代端口已同步更新"
+  fi
+  sub_links
+}
+
+sub_change_server() {
+  sub_ensure_conf || return 1
+  local addr old d
+  old=$(sub_get SUB_SERVER)
+  read -rp " 节点地址（IP 或域名，当前 ${old:-未设置}）: " addr || return 1
+  if [[ -z "$addr" ]]; then info "未修改"; return 0; fi
+  sub_set SUB_SERVER "$addr"
+  ok "节点地址已设为 ${addr}"
+  # 域名还是自动推导的 <IP>.sslip.io 时跟着换；用户自定义过就保留
+  d=$(sub_get SUB_DOMAIN)
+  if [[ -z "$d" || "$d" == "${old//./-}.sslip.io" ]]; then
+    sub_set SUB_DOMAIN ""
+    if [[ -f "$(sub_nginx_conf_path)" ]]; then
+      sub_nginx_apply >/dev/null 2>&1 && ok "公网域名已跟着更新"
+    fi
+  fi
+  sub_links
+}
+
+sub_set_domain_prompt() {
+  sub_ensure_conf || return 1
+  local d cur
+  cur=$(sub_get SUB_DOMAIN)
+  [[ -n "$cur" ]] || cur="$(sub_get SUB_SERVER | sed 's/\./-/g').sslip.io"
+  read -rp " 公网域名（当前 ${cur}，回车恢复默认）: " d || return 1
+  if [[ -z "$d" ]]; then
+    sub_set SUB_DOMAIN ""
+    ok "已恢复默认域名"
+  else
+    sub_set SUB_DOMAIN "$d"
+    ok "域名已设为 ${d}"
+  fi
+  sub_nginx_apply && sub_links
+}
+
+sub_do_public() {
+  sub_set SUB_BIND "0.0.0.0"
+  open_port "$(sub_get SUB_PORT)" TCP
+  sub_restart
+  ok "已切到公网监听：$(sub_get SUB_SERVER):$(sub_get SUB_PORT)（链接已自动换成公网地址）"
+  warn "明文 HTTP，token 等同凭据；想走 HTTPS 用：mieru sub nginx"
+  sub_links
+}
+
+sub_do_local() {
+  sub_set SUB_BIND "127.0.0.1"
+  sub_restart
+  ok "已改回仅本机监听（同机 Sub-Store 继续可用；外部客户端用 mieru sub nginx 的 https 链接）"
+  sub_links
+}
+
+sub_toggle_bind() {
+  sub_ensure_conf || return 1
+  if [[ "$(sub_get SUB_BIND)" == "127.0.0.1" ]]; then
+    sub_do_public
+  else
+    sub_do_local
+  fi
+}
+
 sub_cli() {
   local action=${1:-show} arg=${2:-}
   case "$action" in
-    show|"")        sub_links ;;
-    on|enable|start) sub_enable; sub_links ;;
+    show|"")          sub_links ;;
+    on|enable|start)  sub_ensure_conf && sub_enable && sub_links ;;
     off|disable|stop) sub_disable ;;
-    restart)        sub_restart ;;
-    status)         sub_status ;;
-    check|test)     sub_check ;;
-    store|remote)   sub_store_hint ;;
-    nginx)          sub_nginx_hint ;;
-    token)
-      sub_ensure_conf || return 1
-      local nt; nt=$(rand_str 40)
-      sub_set SUB_TOKEN "$nt"
-      ok "已重置 token（服务实时读取，无需重启）"
-      info "若 Sub-Store 由同步脚本自动维护 URL，会在下个周期自动更新；否则请手动更新订阅源"
-      sub_links ;;
-    server)
-      [[ -n "$arg" ]] || { err "用法：mieru sub server <IP 或域名>"; return 1; }
-      sub_set SUB_SERVER "$arg"
-      ok "节点地址已设为 ${arg}（无需重启）" ;;
+    restart)          sub_restart ;;
+    status)           sub_status ;;
+    check|test)       sub_check ;;
+    store|remote)     sub_store_hint ;;
+    nginx|https)      sub_nginx_apply && sub_links ;;
+    nginx-hint)       sub_nginx_hint ;;
+    nginx-off)        sub_nginx_off ;;
+    token)            sub_reset_token ;;
     port)
-      [[ "$arg" =~ ^[0-9]+$ ]] || { err "用法：mieru sub port <1-65535>"; return 1; }
-      sub_set SUB_PORT "$arg"
-      sub_restart
-      [[ "$(sub_get SUB_BIND)" != "127.0.0.1" ]] && open_port "$arg" TCP
-      sub_links ;;
-    public)
-      sub_set SUB_BIND "0.0.0.0"
-      open_port "$(sub_get SUB_PORT)" TCP
-      sub_restart
-      warn "已开放公网监听，请确认防火墙只放行订阅端口，且不要泄露 token"
-      sub_links ;;
-    local|private)
-      sub_set SUB_BIND "127.0.0.1"
-      sub_restart
-      ok "已改回仅本机监听；Sub-Store 同机不受影响"
-      sub_links ;;
-    menu)           sub_menu ;;
+      if [[ -n "$arg" ]]; then
+        [[ "$arg" =~ ^[0-9]+$ ]] || { err "用法：mieru sub port <1-65535>"; return 1; }
+        (( arg >= 1 && arg <= 65535 )) || { err "端口范围是 1-65535"; return 1; }
+        sub_set SUB_PORT "$arg"
+        sub_restart
+        [[ "$(sub_get SUB_BIND)" != "127.0.0.1" ]] && open_port "$arg" TCP
+        [[ -f "$(sub_nginx_conf_path)" ]] && sub_nginx_apply >/dev/null 2>&1
+        sub_links
+      else
+        sub_change_port
+      fi ;;
+    server)
+      if [[ -n "$arg" ]]; then
+        sub_set SUB_SERVER "$arg"
+        ok "节点地址已设为 ${arg}（无需重启）"
+      else
+        sub_change_server
+      fi ;;
+    domain)
+      if [[ -n "$arg" ]]; then
+        sub_set SUB_DOMAIN "$arg"
+        ok "域名已设为 ${arg}"
+        sub_nginx_apply && sub_links
+      else
+        sub_set_domain_prompt
+      fi ;;
+    public)           sub_do_public ;;
+    local|private)    sub_do_local ;;
+    menu)             sub_menu ;;
     -h|--help|help)
-      echo "用法：mieru sub [show|on|off|restart|status|check|store|nginx|token|server <addr>|port <n>|public|local|menu]" ;;
-    *) err "未知订阅操作：$action"; return 1 ;;
+      echo "用法：mieru sub [show|on|off|restart|status|check|store|nginx|nginx-hint|nginx-off|token|port [n]|server [addr]|domain [name]|public|local|menu]" ;;
+    *)
+      err "未知订阅操作：${action}"
+      echo "用法：mieru sub [show|on|off|restart|status|check|store|nginx|nginx-hint|nginx-off|token|port [n]|server [addr]|domain [name]|public|local|menu]"
+      return 1 ;;
   esac
 }
 
 sub_menu() {
-  local c
+  local choice
   while true; do
     echo
-    echo -e "${BOLD}${CYAN} ======== 订阅服务（v2.1.0） ========${PLAIN}"
-    echo "  1) 查看订阅链接          2) 启用服务"
-    echo "  3) 停用服务              4) 重启服务"
-    echo "  5) 重置 token            6) 设置节点地址"
-    echo "  7) 修改端口              8) 切换公网 / 仅本机"
-    echo "  9) 自检                  10) Sub-Store remote 配置"
-    echo " 11) nginx 反代片段        12) 服务状态"
-    echo "  0) 返回主菜单"
-    if ! read -rp " 请输入选项: " c; then return 0; fi
-    case "$c" in
-      1)  sub_links ;;
-      2)  sub_enable ;;
-      3)  sub_disable ;;
-      4)  sub_restart ;;
-      5)  sub_cli token ;;
-      6)  local a; read -rp " 节点 IP / 域名: " a || true; [[ -n "$a" ]] && sub_cli server "$a" ;;
-      7)  local p; read -rp " 新端口: " p || true; [[ -n "$p" ]] && sub_cli port "$p" ;;
-      8)  echo " a) 公网 0.0.0.0   b) 仅本机 127.0.0.1"; local m
-          read -rp " 选择: " m || true
-          [[ "$m" == "a" ]] && sub_cli public
-          [[ "$m" == "b" ]] && sub_cli local ;;
-      9)  sub_check ;;
-      10) sub_store_hint ;;
-      11) sub_nginx_hint ;;
-      12) sub_status ;;
+    echo -e "${BOLD}${CYAN} ========== 订阅服务（Sub-Store / Clash） ==========${PLAIN}"
+    echo -e "  ${BOLD}1.${PLAIN}  查看订阅链接 / 启用服务"
+    echo -e "  ${BOLD}2.${PLAIN}  停用服务"
+    echo -e "  ${BOLD}3.${PLAIN}  重启服务"
+    echo -e "  ${BOLD}4.${PLAIN}  服务状态"
+    echo -e "  ${BOLD}5.${PLAIN}  自检（逐个目标请求一次）"
+    echo -e "  ${BOLD}6.${PLAIN}  Sub-Store remote 源怎么填"
+    echo -e "  ${BOLD}7.${PLAIN}  公网 HTTPS（自动 nginx，装完默认已配）"
+    echo -e "  ${BOLD}8.${PLAIN}  重置 token"
+    echo -e "  ${BOLD}9.${PLAIN}  修改订阅端口"
+    echo -e "  ${BOLD}10.${PLAIN} 设置节点地址"
+    echo -e "  ${BOLD}11.${PLAIN} 切换公网监听 / 仅本机"
+    echo -e "  ${BOLD}12.${PLAIN} 设置公网域名（默认 <IP>.sslip.io）"
+    echo -e "  ${BOLD}0.${PLAIN}  返回主菜单"
+    if ! read -rp "  请选择: " choice; then return 0; fi
+    case "$choice" in
+      1)  sub_ensure_conf && sub_enable && sub_links ;;
+      2)  sub_disable ;;
+      3)  sub_restart ;;
+      4)  sub_status ;;
+      5)  sub_check ;;
+      6)  sub_store_hint ;;
+      7)  sub_nginx_apply && sub_links ;;
+      8)  sub_reset_token ;;
+      9)  sub_change_port ;;
+      10) sub_change_server ;;
+      11) sub_toggle_bind ;;
+      12) sub_set_domain_prompt ;;
       0)  return 0 ;;
-      *)  warn "无效选项" ;;
+      *)  err "请输入正确的选项" ;;
     esac
-    pause
+    if ! read -rp "  按回车继续..." _; then return 0; fi
   done
 }
 
