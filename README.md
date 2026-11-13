@@ -11,8 +11,8 @@ mieru 一键安装脚本，自动搭建 TCP 和 UDP 账号，生成官方配置�
 - 安装完成后直接输出客户端 JSON 配置和 Clash Meta / Mihomo 配置片段
 - **内置订阅服务**：自动生成订阅链接，多格式输出（Clash 片段 / 完整配置 / base64 / URI / JSON）
 - **兼容 Sub-Store `remote` 源**：让 Sub-Store 直接订阅本机，节点变更（`mieru regen`）自动生效，无需同步脚本写死内容
-- **装完默认就有公网 HTTPS 订阅**：自动在 nginx 443 上反代，复用机器上现有证书，域名默认 `<IP>.sslip.io`，不需要买域名、不需要手工改 nginx
-- **公网开关**：`mieru sub public` 开 / `mieru sub local` 关，公网一律走 HTTPS，不提供明文 HTTP 链接
+- **装完默认就有公网 HTTPS 订阅**：订阅服务自己另开一个 HTTPS 端口，用本机 IP 证书，形如 `https://<IP>:40331/<token>/sub`——不占 443、不依赖 nginx、不和面板抢端口
+- **公网开关**：`mieru sub public` 开 / `mieru sub local` 关，公网一律 HTTPS，不提供明文 HTTP
 - 自动配置防火墙（支持 ufw / iptables / firewalld）
 - 支持 BBR 加速一键开启
 - VPS 重启后服务自动恢复（systemd 托管）
@@ -36,7 +36,21 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 
 ---
 
-## v2.3.0 更新日志
+## v2.4.0 更新日志
+
+- **公网订阅改为独立 HTTPS 端口**：订阅服务进程自己再监听 `0.0.0.0:40331`（可改），
+  直接用本机 **IP 证书** 对外提供 `https://<IP>:40331/<token>/sub`，与 nginx、443 完全无关
+- **不再依赖 nginx**：删掉 `sub nginx / nginx-hint / nginx-off / domain` 与共享 vhost 那套逻辑；
+  证书只从磁盘读，用 `openssl -checkhost` 校验是否覆盖本机 IP
+- **证书热重载**：证书文件 mtime 变化时自动重建 SSLContext，acme.sh / certbot 续期后不用重启服务
+- **端口自动避让**：默认 40331，被占用时自动往后找（40331–40360）；`mieru sub tls-port 8443` 可指定
+- **只监听回环那一刻不变**：`127.0.0.1:13356` 仍给同机 Sub-Store 用；对外只有 HTTPS 端口
+- **systemd 加固修正**：`ProtectHome=true` 会让服务读不到 `/root/cert`，改为 `read-only`
+- **v2.2.0 / v2.3.0 的 nginx 方案已废弃**：那两个版本依赖 nginx 443 + 域名，与面板/其它站点冲突，v2.4.0 起不再使用
+
+---
+
+## v2.3.0 更新日志（nginx 方案，已废弃）
 
 - **公网订阅只走 HTTPS**：`mieru sub public` 不再把服务改成 `0.0.0.0` 明文监听，改为「启用 nginx 443 反代」；
   `mieru sub local` 改为「关闭公网反代」（服务始终只监听 `127.0.0.1`）
@@ -48,7 +62,7 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 
 ---
 
-## v2.2.0 更新日志
+## v2.2.0 更新日志（nginx 方案，已废弃）
 
 - **默认公网 HTTPS 订阅**：安装完自动生成 `/etc/nginx/conf.d/50-mieru-sub.conf`，在 **443** 上反代到
   `127.0.0.1` 的订阅服务，装完即有一个外部能直接用的 `https://<域名>/mieru/<token>/sub` 链接
@@ -95,7 +109,7 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 
 ```
  ==================================================
-   Mieru 管理面板 v2.3.0
+   Mieru 管理面板 v2.4.0
    https://github.com/helloktity/Mieru-Plus
  ==================================================
  BBR 加速：  已启用
@@ -136,7 +150,7 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 | 11 | 备份 `/etc/mita` 到 `/root/mieru-backup`，或从备份恢复 |
 | 12 | 重装 Mieru（重置账号与端口） |
 | 13 | 卸载 mita 及所有配置文件（含订阅服务） |
-| 14 | 订阅服务子面板：查看链接、启停、重置 token、改端口、切公网/仅本机、自检、nginx 片段 |
+| 14 | 订阅服务子面板：查看链接、启停、重置 token、改端口、开/关公网 HTTPS、自检 |
 
 ### 子命令（非交互）
 
@@ -163,14 +177,13 @@ mieru sub restart      # 重启订阅服务
 mieru sub status       # 服务状态 + 监听地址
 mieru sub check        # 自检：逐个 target 请求本地端点
 mieru sub store        # 打印 Sub-Store remote 源配置
-mieru sub nginx        # 自动配置公网 HTTPS（nginx 443 + 现有证书）
-mieru sub nginx-hint   # 只打印 location 片段，自己贴到已有站点
-mieru sub nginx-off    # 移除自动生成的 nginx 片段
-mieru sub domain <域名>  # 指定公网域名（默认 <IP>.sslip.io）
+mieru sub https        # 开公网 HTTPS（IP + 独立端口，自动挑证书）
+mieru sub tls-off      # 关公网 HTTPS
+mieru sub tls-port <n> # 指定 HTTPS 端口（默认 40331）
 mieru sub token        # 重置 40 位 token（旧链接立即失效）
 mieru sub server <addr>   # 指定订阅里输出的节点地址（IP 或域名）
 mieru sub port <n>     # 修改订阅服务监听端口
-mieru sub public       # 开公网 HTTPS（nginx 443 反代，自动配）
+mieru sub public       # 开公网 HTTPS（等同 https）
 mieru sub local        # 关公网 HTTPS（服务仍监听 127.0.0.1）
 mieru sub menu         # 进入订阅子面板
 ```
@@ -237,49 +250,31 @@ mieru sub store        # 直接打印下面这段配置
 
 ### 公网访问
 
-**默认已经配好**：安装时如果机器上有 nginx 和证书，脚本会自动在 443 上反代，直接给出
+**默认已经配好**：装完自动开一个独立 HTTPS 端口（默认 40331），用本机 IP 证书，直接给出
 
 ```
-https://216-167-114-48.sslip.io/mieru/<token>/sub?target=clash
+https://216.167.114.48:40331/<token>/sub?target=clash
 ```
 
-域名默认是 `<IP 横线形式>.sslip.io`，天然解析到本机 IP，不用买域名、不用改 DNS。
-证书复用机器上已有的（域名证书优先，没有就退用 IP 证书），也不新申请。
+- 用 **IP** 而不是域名：域名要走 DNS 和域名证书，IP 证书（`/root/cert/ip/`）本来就有
+- 单独占一个端口：不碰 443、不碰 nginx，x-ui / 面板 / 别的网站完全不受影响
+- 证书续期后自动生效：服务按文件 mtime 重载 SSLContext，不用重启
 
-想换域名或换端口：
+常用操作：
 
 ```bash
-mieru sub domain example.com    # 指定域名（证书要能匹配该域名）
-mieru sub nginx 8443            # 指定 HTTPS 端口（默认 443）
-mieru sub nginx                 # 重新生成片段（幂等，随时可重复执行）
-mieru sub nginx-off             # 移除片段，订阅服务本身不受影响
+mieru sub public            # 开（自动挑能覆盖本机 IP 的证书、自动避让占用端口）
+mieru sub local             # 关
+mieru sub tls-port 8443     # 换端口
+mieru sub                    # 查看公网 / 本机两类链接
 ```
 
-没有 nginx，或者不想让脚本动 nginx 配置时，只打印片段自己贴（**不提供明文 HTTP 方式**）：
+证书从这几个位置找：`/root/cert/ip` → `/root/cert/domain` → nginx 当前在用的证书目录 →
+`/etc/nginx/certs` → `/etc/ssl/mieru`。优先选 SAN 覆盖本机 IP 的那张（`openssl -checkhost`）。
 
-```bash
-mieru sub nginx-hint
-```
+没有证书就先给 IP 签一张（acme.sh 支持 IP 证书），再 `mieru sub public`。
 
-> 早期版本有 `mieru sub public` 直接监听 `0.0.0.0` 的明文模式，v2.3.0 起已移除：
-> 订阅链接等同凭据，明文 HTTP 会在链路上直接暴露 token。
-
-片段形如：
-
-```nginx
-location /mieru/<token>/ {
-  proxy_pass http://127.0.0.1:13356/<token>/;
-  proxy_http_version 1.1;
-  proxy_set_header Host $host;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
-  proxy_read_timeout 30s;
-  add_header Cache-Control "no-store" always;
-}
-```
-
-切到公网监听（`mieru sub public`）后，`mieru sub` 打印的链接会自动换成 `http://<公网地址>:<端口>/...`，
-不用再手工替换 `127.0.0.1`。
+> 早期 v2.2.0 / v2.3.0 试过「nginx 443 + 域名」的方案，会和面板抢 443、还要域名证书，v2.4.0 已弃用。
 
 ---
 
