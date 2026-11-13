@@ -12,7 +12,7 @@ mieru 一键安装脚本，自动搭建 TCP 和 UDP 账号，生成官方配置�
 - **内置订阅服务**：自动生成订阅链接，多格式输出（Clash 片段 / 完整配置 / base64 / URI / JSON）
 - **兼容 Sub-Store `remote` 源**：让 Sub-Store 直接订阅本机，节点变更（`mieru regen`）自动生效，无需同步脚本写死内容
 - **装完默认就有公网 HTTPS 订阅**：自动在 nginx 443 上反代，复用机器上现有证书，域名默认 `<IP>.sslip.io`，不需要买域名、不需要手工改 nginx
-- **订阅可一键切换公网 / 本机**：`mieru sub public` / `mieru sub local`，切到公网后链接自动变成公网地址
+- **公网开关**：`mieru sub public` 开 / `mieru sub local` 关，公网一律走 HTTPS，不提供明文 HTTP 链接
 - 自动配置防火墙（支持 ufw / iptables / firewalld）
 - 支持 BBR 加速一键开启
 - VPS 重启后服务自动恢复（systemd 托管）
@@ -33,6 +33,18 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 ```
 
 > 只需执行一次。脚本会自动把自身注册为 `mieru` 命令，以后在任意目录输入 `mieru` 即可打开管理面板，无需重复下载。
+
+---
+
+## v2.3.0 更新日志
+
+- **公网订阅只走 HTTPS**：`mieru sub public` 不再把服务改成 `0.0.0.0` 明文监听，改为「启用 nginx 443 反代」；
+  `mieru sub local` 改为「关闭公网反代」（服务始终只监听 `127.0.0.1`）
+- **共享 vhost**：`/etc/nginx/conf.d/50-subscription.conf` + `/etc/nginx/snippets/subscription/*.conf`，
+  与 snell 脚本共用同一个 443 server，避免两者都写 `listen 443 ssl` 同一域名导致
+  `conflicting server name`、后者 location 被忽略
+- **输出只留两类链接**：`[公网 HTTPS]` 与 `[本机 · 回环不出网]`，不再出现任何明文公网地址
+- **兼容旧配置**：老版本生成的 `50-mieru-sub.conf` 会被自动清掉；发现 `SUB_BIND` 仍是 `0.0.0.0` 会提示修正
 
 ---
 
@@ -83,7 +95,7 @@ curl -fsSL -o mieru-plus.sh https://raw.githubusercontent.com/helloktity/Mieru-P
 
 ```
  ==================================================
-   Mieru 管理面板 v2.2.0
+   Mieru 管理面板 v2.3.0
    https://github.com/helloktity/Mieru-Plus
  ==================================================
  BBR 加速：  已启用
@@ -158,8 +170,8 @@ mieru sub domain <域名>  # 指定公网域名（默认 <IP>.sslip.io）
 mieru sub token        # 重置 40 位 token（旧链接立即失效）
 mieru sub server <addr>   # 指定订阅里输出的节点地址（IP 或域名）
 mieru sub port <n>     # 修改订阅服务监听端口
-mieru sub public       # 切到公网监听 0.0.0.0（链接自动换成公网地址）
-mieru sub local        # 改回仅本机 127.0.0.1（同机 Sub-Store 够用）
+mieru sub public       # 开公网 HTTPS（nginx 443 反代，自动配）
+mieru sub local        # 关公网 HTTPS（服务仍监听 127.0.0.1）
 mieru sub menu         # 进入订阅子面板
 ```
 
@@ -243,15 +255,14 @@ mieru sub nginx                 # 重新生成片段（幂等，随时可重复�
 mieru sub nginx-off             # 移除片段，订阅服务本身不受影响
 ```
 
-没有 nginx，或者不想让脚本动 nginx 配置时，用两种方式之一：
+没有 nginx，或者不想让脚本动 nginx 配置时，只打印片段自己贴（**不提供明文 HTTP 方式**）：
 
 ```bash
-# 方式一：直接监听公网（明文 HTTP，记得放行防火墙）
-mieru sub public
-
-# 方式二：只打印片段，自己贴进已有的 HTTPS server 块
 mieru sub nginx-hint
 ```
+
+> 早期版本有 `mieru sub public` 直接监听 `0.0.0.0` 的明文模式，v2.3.0 起已移除：
+> 订阅链接等同凭据，明文 HTTP 会在链路上直接暴露 token。
 
 片段形如：
 

@@ -12,12 +12,13 @@
 #   5. 新增：启动/停止/状态/升级/重生成账号/备份恢复/firewalld 放行
 #  6. v2.1.0 新增：内置订阅服务，输出订阅链接（兼容 Sub-Store remote 源）
 #  7. v2.2.0 新增：装完默认自带公网 HTTPS 订阅（自动配 nginx 443 + 现有证书）
+#  8. v2.3.0 变更：公网订阅只走 HTTPS，不再提供明文 HTTP 监听
 #     —— 原有功能全部保留，订阅为纯增量特性
 # ============================================================
 
 set -uo pipefail
 
-SCRIPT_VERSION="v2.2.0"
+SCRIPT_VERSION="v2.3.0"
 MIERU_REPO="enfein/mieru"
 UPSTREAM_REPO="Alvin9999-newpac/Mieru-Plus"
 
@@ -1304,22 +1305,15 @@ sub_check() {
 
 sub_links() {
   [[ -f "$SUB_CONF" ]] || { warn "订阅服务尚未启用，执行：mieru sub on"; return 1; }
-  local token port bind server base host label pub
+  local token port bind server base label pub
   token=$(sub_get SUB_TOKEN)
   port=$(sub_get SUB_PORT)
   bind=$(sub_get SUB_BIND)
   server=$(sub_get SUB_SERVER)
 
-  # 与 snell 一致：切到公网监听后，链接自动换成公网地址
-  host="127.0.0.1"
-  label="本机 · Sub-Store 同机"
-  if [[ "$bind" != "127.0.0.1" ]]; then
-    host=$(sub_get SUB_DOMAIN)
-    [[ -n "$host" ]] || host="$server"
-    [[ -n "$host" ]] || host="127.0.0.1"
-    label="公网 · 明文 HTTP"
-  fi
-  base="http://${host}:${port}/${token}"
+  # 订阅服务只监听回环；公网一律经 nginx 走 HTTPS，不发明文 http 链接
+  base="http://127.0.0.1:${port}/${token}"
+  label="本机 · 回环不出网，Sub-Store 同机用"
   pub=$(sub_public_url 2>/dev/null) || pub=""
 
   echo
@@ -1346,13 +1340,14 @@ sub_links() {
   echo "   ${base}/health                     (存活探测)"
 
   echo
-  if [[ "$bind" == "127.0.0.1" ]]; then
-    if [[ -n "$pub" ]]; then
-      info "本机监听 + nginx 反代：外部请用上面的 https 链接"
-    else
-      warn "仅监听 127.0.0.1，外部不可访问"
-      echo "   切公网：mieru sub public      走 HTTPS：mieru sub nginx"
-    fi
+  if [[ -n "$pub" ]]; then
+    info "公网经 nginx 走 HTTPS；订阅服务本身只监听回环"
+  else
+    warn "当前只有本机链接（外部不可用）"
+    echo "   开公网 HTTPS：mieru sub public     关闭：mieru sub local"
+  fi
+  if [[ "$bind" != "127.0.0.1" ]]; then
+    warn "检测到监听地址是 ${bind}（明文 HTTP 已不再使用），建议执行：mieru sub local"
   fi
   echo -e " ${YELLOW}链接等同凭据，别公开贴；泄露后 mieru sub token 重置${PLAIN}"
   echo -e "${BOLD}${CYAN} ================================${PLAIN}"
@@ -1445,7 +1440,12 @@ sub_detect_tls() {
   return 1
 }
 
-sub_nginx_conf_path() { echo "/etc/nginx/conf.d/50-mieru-sub.conf"; }
+# 共享 vhost：mieru 和 snell 都在 443 上用同一个域名，各自建 server 会冲突
+# （nginx 报 conflicting server name，后加载的 location 直接被忽略）。
+# 所以统一用一个 vhost + include 目录，各服务只写自己的 location 片段。
+sub_nginx_vhost_path()   { echo "/etc/nginx/conf.d/50-subscription.conf"; }
+sub_nginx_snippet_dir()  { echo "/etc/nginx/snippets/subscription"; }
+sub_nginx_conf_path()    { echo "$(sub_nginx_snippet_dir)/mieru.conf"; }
 
 sub_nginx_apply() {   # [port]
   [[ -f "$SUB_CONF" ]] || sub_ensure_conf || return 1
@@ -1455,7 +1455,7 @@ sub_nginx_apply() {   # [port]
   }
   [[ -d /etc/nginx/conf.d ]] || { warn "没有 /etc/nginx/conf.d，跳过自动公网 HTTPS"; return 1; }
 
-  local token port https_port picked host cert key suffix conf alt
+  local token port https_port picked host cert key suffix conf vhost sdir alt
   token=$(sub_get SUB_TOKEN)
   port=$(sub_get SUB_PORT)
   https_port=${1:-$(sub_get SUB_HTTPS_PORT)}
@@ -1480,10 +1480,18 @@ sub_nginx_apply() {   # [port]
   host=${picked%%|*}; picked=${picked#*|}
   cert=${picked%%|*}; key=${picked#*|}
 
+  vhost=$(sub_nginx_vhost_path)
+  sdir=$(sub_nginx_snippet_dir)
   conf=$(sub_nginx_conf_path)
-  cat > "$conf" <<NGINXEOF
-# 由 Mieru-Plus 生成（mieru sub nginx）—— 重新生成会覆盖本文件
-# 订阅服务监听 127.0.0.1:${port}，这里只做 HTTPS 反代；证书：${cert}
+  mkdir -p "$sdir"
+
+  # 老版本留下的是独立 server 块，与新 vhost 同名冲突，直接清掉
+  rm -f /etc/nginx/conf.d/50-mieru-sub.conf
+
+  if [[ ! -f "$vhost" ]]; then
+    cat > "$vhost" <<NGINXEOF
+# 订阅服务共享 vhost（mieru / snell 共用，由脚本生成，勿手改）
+# 各服务只往该目录写自己的 location 片段
 server {
     listen ${https_port} ssl;
     server_name ${host};
@@ -1491,32 +1499,38 @@ server {
     ssl_certificate     ${cert};
     ssl_certificate_key ${key};
     ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_session_cache   shared:MieruSub:1m;
+    ssl_session_cache   shared:SubVhost:1m;
     ssl_session_timeout 10m;
 
-    access_log /var/log/nginx/mieru-sub.log;
+    access_log /var/log/nginx/subscription.log;
     server_tokens off;
 
-    # 订阅本体（路径里的 token 就是鉴权，转发时保留）
-    location /mieru/${token}/ {
-        proxy_pass http://127.0.0.1:${port}/${token}/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 30s;
-        add_header Cache-Control "no-store" always;
-    }
+    include ${sdir}/*.conf;
 
     location / { return 404; }
+}
+NGINXEOF
+  fi
+
+  cat > "$conf" <<NGINXEOF
+# 由 Mieru-Plus 生成（mieru sub nginx）—— 重新生成会覆盖本文件
+# 订阅服务监听 127.0.0.1:${port}；HTTPS 由 $(basename "$vhost") 统一提供
+location /mieru/${token}/ {
+    proxy_pass http://127.0.0.1:${port}/${token}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 30s;
+    add_header Cache-Control "no-store" always;
 }
 NGINXEOF
 
   if ! nginx -t >/tmp/mieru-sub-nginx.log 2>&1; then
     err "nginx 配置校验失败，已回滚本次片段"
     tail -5 /tmp/mieru-sub-nginx.log | sed 's/^/     /'
-    rm -f "$conf"; rm -f /tmp/mieru-sub-nginx.log
+    rm -f "$conf" /tmp/mieru-sub-nginx.log
     return 1
   fi
   rm -f /tmp/mieru-sub-nginx.log
@@ -1524,24 +1538,31 @@ NGINXEOF
   systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || {
     err "nginx 重载失败"; return 1
   }
+  open_port "$https_port" TCP >/dev/null 2>&1 || true
 
   suffix=""
   [[ "$https_port" != "443" ]] && suffix=":${https_port}"
   sub_set SUB_HTTPS_PORT "$https_port"
   sub_set SUB_PUBLIC "https://${host}${suffix}/mieru/${token}"
   ok "公网订阅已就绪：https://${host}${suffix}/mieru/<token>/sub?target=clash"
-  info "片段：${conf}（证书 ${cert}，端口 ${https_port}）"
+  info "片段：${conf}（共享 vhost ${vhost}，证书 ${cert}，端口 ${https_port}）"
   return 0
 }
 
 sub_nginx_off() {
-  local conf
+  local conf vhost sdir
   conf=$(sub_nginx_conf_path)
+  vhost=$(sub_nginx_vhost_path)
+  sdir=$(sub_nginx_snippet_dir)
   [[ -f "$conf" ]] || { info "没有自动配置的公网片段"; return 0; }
   rm -f "$conf"
+  # 没有其它服务在用这个 vhost 时一并删掉
+  if [[ -d "$sdir" ]] && ! ls "$sdir"/*.conf >/dev/null 2>&1; then
+    rm -f "$vhost"
+  fi
   nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; }
   sub_set SUB_PUBLIC ""
-  ok "已移除公网 HTTPS 片段（订阅服务本身不变）"
+  ok "已关闭公网 HTTPS（订阅服务本身不变）"
 }
 
 # 公网链接（有则打印，无则返回 1）
@@ -1648,28 +1669,28 @@ sub_set_domain_prompt() {
   sub_nginx_apply && sub_links
 }
 
+# 公网订阅只走 HTTPS：订阅服务永久只监听回环，不再提供 0.0.0.0 明文监听
 sub_do_public() {
-  sub_set SUB_BIND "0.0.0.0"
-  open_port "$(sub_get SUB_PORT)" TCP
-  sub_restart
-  ok "已切到公网监听：$(sub_get SUB_SERVER):$(sub_get SUB_PORT)（链接已自动换成公网地址）"
-  warn "明文 HTTP，token 等同凭据；想走 HTTPS 用：mieru sub nginx"
+  sub_ensure_conf || return 1
+  sub_nginx_apply || return 1
   sub_links
 }
 
 sub_do_local() {
+  sub_ensure_conf || return 1
+  sub_nginx_off
   sub_set SUB_BIND "127.0.0.1"
-  sub_restart
-  ok "已改回仅本机监听（同机 Sub-Store 继续可用；外部客户端用 mieru sub nginx 的 https 链接）"
+  sub_restart >/dev/null 2>&1 || true
+  ok "已关闭公网订阅（订阅服务仍监听 127.0.0.1，同机 Sub-Store 照常可用）"
   sub_links
 }
 
-sub_toggle_bind() {
+sub_toggle_public() {
   sub_ensure_conf || return 1
-  if [[ "$(sub_get SUB_BIND)" == "127.0.0.1" ]]; then
-    sub_do_public
-  else
+  if [[ -f "$(sub_nginx_conf_path)" ]]; then
     sub_do_local
+  else
+    sub_do_public
   fi
 }
 
@@ -1741,7 +1762,7 @@ sub_menu() {
     echo -e "  ${BOLD}8.${PLAIN}  重置 token"
     echo -e "  ${BOLD}9.${PLAIN}  修改订阅端口"
     echo -e "  ${BOLD}10.${PLAIN} 设置节点地址"
-    echo -e "  ${BOLD}11.${PLAIN} 切换公网监听 / 仅本机"
+    echo -e "  ${BOLD}11.${PLAIN} 开 / 关公网 HTTPS（仅本机 ↔ 公网）"
     echo -e "  ${BOLD}12.${PLAIN} 设置公网域名（默认 <IP>.sslip.io）"
     echo -e "  ${BOLD}0.${PLAIN}  返回主菜单"
     if ! read -rp "  请选择: " choice; then return 0; fi
@@ -1756,7 +1777,7 @@ sub_menu() {
       8)  sub_reset_token ;;
       9)  sub_change_port ;;
       10) sub_change_server ;;
-      11) sub_toggle_bind ;;
+      11) sub_toggle_public ;;
       12) sub_set_domain_prompt ;;
       0)  return 0 ;;
       *)  err "请输入正确的选项" ;;
